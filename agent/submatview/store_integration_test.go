@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/hashicorp/go-hclog"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -80,7 +82,7 @@ func TestStore_IntegrationWithBackend(t *testing.T) {
 		ServiceName: "srv1",
 	}
 	updateCh := make(chan cache.UpdateEvent, 10)
-	states := map[uint64][]string{}
+	states := make(map[uint64][]string)
 
 	cgroup, cctx := errgroup.WithContext(ctx)
 	cgroup.Go(func() error {
@@ -108,7 +110,14 @@ func TestStore_IntegrationWithBackend(t *testing.T) {
 
 	require.True(t, len(states) > 10, "expected more than %d events", len(states))
 	for idx, nodes := range states {
-		require.Equal(t, producers[0].nodesByIndex[idx], nodes, idx)
+		assertDeepEqual(t, idx, producers[0].nodesByIndex[idx], nodes)
+	}
+}
+
+func assertDeepEqual(t *testing.T, idx uint64, x, y interface{}) {
+	t.Helper()
+	if diff := cmp.Diff(x, y, cmpopts.EquateEmpty()); diff != "" {
+		t.Fatalf("assertion failed: values at index %d are not equal\n--- expected\n+++ actual\n%v", idx, diff)
 	}
 }
 
@@ -223,8 +232,11 @@ func (e *eventProducer) Produce(ctx context.Context) {
 				Payload: state.EventPayloadCheckServiceNode{
 					Op: pbsubscribe.CatalogOp_Deregister,
 					Value: &structs.CheckServiceNode{
-						Node:    &structs.Node{Node: node},
-						Service: &structs.NodeService{ID: e.srvName},
+						Node: &structs.Node{Node: node},
+						Service: &structs.NodeService{
+							ID:      e.srvName,
+							Service: e.srvName,
+						},
 					},
 				},
 			}
