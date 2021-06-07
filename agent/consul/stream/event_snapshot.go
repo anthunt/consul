@@ -1,5 +1,7 @@
 package stream
 
+import "fmt"
+
 // eventSnapshot represents the state of memdb for a given topic and key at some
 // point in time. It is modelled as a buffer of events so that snapshots can be
 // streamed to possibly multiple subscribers concurrently, and can be trivially
@@ -49,6 +51,8 @@ func (s *eventSnapshot) appendAndSplice(req SubscribeRequest, fn SnapshotFunc, t
 func (s *eventSnapshot) spliceFromTopicBuffer(topicBufferHead *bufferItem, idx uint64) {
 	item := topicBufferHead
 	for {
+		fmt.Printf("idx %d, current item: %#v\n", idx, item)
+
 		switch {
 		case item.Err != nil:
 			// This case is not currently possible because errors can only come

@@ -42,21 +42,20 @@ func TestStore_IntegrationWithBackend(t *testing.T) {
 	defer cancel()
 	go pub.Run(ctx)
 
-	addr := newServer(t, pub)
-
-	// TODO: make configurable
-	runTime := 3 * time.Second
-	ctx, cancel = context.WithTimeout(ctx, runTime)
-	defer cancel()
-
 	store := submatview.NewStore(hclog.New(nil))
 	go store.Run(ctx)
 
-	var maxIndex uint64 = 200
+	addr := runServer(t, pub)
+
+	var maxIndex uint64 = 25
 	count := &counter{latest: 3}
-	producers := []*eventProducer{
-		newEventProducer(pub, pbsubscribe.Topic_ServiceHealth, "srv1", count, maxIndex),
-		newEventProducer(pub, pbsubscribe.Topic_ServiceHealth, "srv2", count, maxIndex),
+	producers := map[string]*eventProducer{
+		"srv1": newEventProducer(pub, pbsubscribe.Topic_ServiceHealth, "srv1", count, maxIndex),
+		"srv2": newEventProducer(pub, pbsubscribe.Topic_ServiceHealth, "srv2", count, maxIndex),
+	}
+
+	consumers := []*consumer{
+		newConsumer(t, addr, store),
 	}
 
 	pgroup, pctx := errgroup.WithContext(ctx)
@@ -68,50 +67,17 @@ func TestStore_IntegrationWithBackend(t *testing.T) {
 		})
 	}
 
-	conn, err := grpc.Dial(addr.String(), grpc.WithInsecure())
-	require.NoError(t, err)
-
-	c := health.Client{
-		UseStreamingBackend: true,
-		ViewStore:           store,
-		MaterializerDeps: health.MaterializerDeps{
-			Conn:   conn,
-			Logger: hclog.New(nil),
-		},
-	}
-
-	req := structs.ServiceSpecificRequest{
-		ServiceName: "srv1",
-	}
-	updateCh := make(chan cache.UpdateEvent, 10)
-	states := make(map[uint64][]string)
-
 	cgroup, cctx := errgroup.WithContext(ctx)
 	cgroup.Go(func() error {
-		return c.Notify(cctx, req, "", updateCh)
-	})
-	cgroup.Go(func() error {
-		var idx uint64
-		for {
-			if idx >= maxIndex {
-				return nil
-			}
-			select {
-			case u := <-updateCh:
-				idx = u.Meta.Index
-				states[u.Meta.Index] = stateFromUpdates(u)
-			case <-ctx.Done():
-				return nil
-			}
-		}
+		return consumers[0].Consume(cctx, "srv1", maxIndex)
 	})
 
 	_ = pgroup.Wait()
 	_ = cgroup.Wait()
 
-	require.True(t, len(states) > 10, "expected more than %d events", len(states))
-	for idx, nodes := range states {
-		assertDeepEqual(t, idx, producers[0].nodesByIndex[idx], nodes)
+	require.True(t, len(consumers[0].states) > 2, "expected more than %d events", len(consumers[0].states))
+	for idx, nodes := range consumers[0].states {
+		assertDeepEqual(t, idx, producers["srv1"].nodesByIndex[idx], nodes)
 	}
 }
 
@@ -132,7 +98,7 @@ func stateFromUpdates(u cache.UpdateEvent) []string {
 	return result
 }
 
-func newServer(t *testing.T, pub *stream.EventPublisher) net.Addr {
+func runServer(t *testing.T, pub *stream.EventPublisher) net.Addr {
 	subSrv := &subscribe.Server{
 		Backend: backend{pub: pub},
 		Logger:  hclog.New(nil),
@@ -239,6 +205,7 @@ func (e *eventProducer) Produce(ctx context.Context) {
 					},
 				},
 			}
+			fmt.Printf("%d: DEREG %v %v\n", idx, e.srvName, node)
 
 		case 1: // Register new
 			node := nodeName(nextID)
@@ -259,6 +226,7 @@ func (e *eventProducer) Produce(ctx context.Context) {
 					},
 				},
 			}
+			fmt.Printf("%d: REG   %v %v\n", idx, e.srvName, node)
 
 		case 2: // Register update
 			node := nodes[e.rand.Intn(len(nodes))]
@@ -276,6 +244,7 @@ func (e *eventProducer) Produce(ctx context.Context) {
 					},
 				},
 			}
+			fmt.Printf("%d: UPD   %v %v\n", idx, e.srvName, node)
 
 		}
 
@@ -310,4 +279,54 @@ type counter struct {
 
 func (c *counter) Next() uint64 {
 	return atomic.AddUint64(&c.latest, 1)
+}
+
+type consumer struct {
+	healthClient *health.Client
+	states       map[uint64][]string
+}
+
+func newConsumer(t *testing.T, addr net.Addr, store *submatview.Store) *consumer {
+	conn, err := grpc.Dial(addr.String(), grpc.WithInsecure())
+	require.NoError(t, err)
+
+	c := &health.Client{
+		UseStreamingBackend: true,
+		ViewStore:           store,
+		MaterializerDeps: health.MaterializerDeps{
+			Conn:   conn,
+			Logger: hclog.New(nil),
+		},
+	}
+
+	return &consumer{
+		healthClient: c,
+		states:       make(map[uint64][]string),
+	}
+}
+
+func (c *consumer) Consume(ctx context.Context, srv string, maxIndex uint64) error {
+	req := structs.ServiceSpecificRequest{ServiceName: srv}
+	updateCh := make(chan cache.UpdateEvent, 10)
+
+	group, cctx := errgroup.WithContext(ctx)
+	group.Go(func() error {
+		return c.healthClient.Notify(cctx, req, "", updateCh)
+	})
+	group.Go(func() error {
+		var idx uint64
+		for {
+			if idx >= maxIndex {
+				return nil
+			}
+			select {
+			case u := <-updateCh:
+				idx = u.Meta.Index
+				c.states[u.Meta.Index] = stateFromUpdates(u)
+			case <-cctx.Done():
+				return nil
+			}
+		}
+	})
+	return group.Wait()
 }
