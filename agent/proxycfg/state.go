@@ -941,7 +941,7 @@ func (s *state) handleUpdateUpstreams(u cache.UpdateEvent, snap *ConfigSnapshot)
 		var passthroughAddrs map[string]ServicePassthroughAddrs
 
 		for _, node := range resp.Nodes {
-			if node.Service.Proxy.TransparentProxy.DialedDirectly {
+			if snap.Proxy.Mode == structs.ProxyModeTransparent && node.Service.Proxy.TransparentProxy.DialedDirectly {
 				if passthroughAddrs == nil {
 					passthroughAddrs = make(map[string]ServicePassthroughAddrs)
 				}
@@ -957,7 +957,10 @@ func (s *state) handleUpdateUpstreams(u cache.UpdateEvent, snap *ConfigSnapshot)
 				name := node.Service.CompoundServiceName().String()
 				if _, ok := upstreamsSnapshot.PassthroughUpstreams[name]; !ok {
 					upstreamsSnapshot.PassthroughUpstreams[name] = ServicePassthroughAddrs{
-						SNI:   sni,
+						SNI: sni,
+
+						// Stored in a set because it's possible for these to be duplicated
+						// when the upstream-target is targeted by multiple discovery chains.
 						Addrs: make(map[string]struct{}),
 					}
 				}

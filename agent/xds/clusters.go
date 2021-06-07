@@ -191,6 +191,7 @@ func makePassthroughClusters(cfgSnap *proxycfg.ConfigSnapshot) ([]proto.Message,
 	}
 
 	for _, passthrough := range cfgSnap.ConnectProxy.PassthroughUpstreams {
+		// Prefixed with passthrough to distinguish from non-passthrough clusters for the same upstream.
 		name := "passthrough." + passthrough.SNI
 
 		c := envoy_cluster_v3.Cluster{
