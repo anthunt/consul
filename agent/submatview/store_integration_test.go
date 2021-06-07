@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"net"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,24 +18,28 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 
-	"github.com/hashicorp/consul/agent/cache"
-	"github.com/hashicorp/consul/agent/rpcclient/health"
-
 	"github.com/hashicorp/consul/acl"
+	"github.com/hashicorp/consul/agent/cache"
 	"github.com/hashicorp/consul/agent/consul/state"
 	"github.com/hashicorp/consul/agent/consul/stream"
 	"github.com/hashicorp/consul/agent/rpc/subscribe"
+	"github.com/hashicorp/consul/agent/rpcclient/health"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/agent/submatview"
 	"github.com/hashicorp/consul/proto/pbsubscribe"
 )
 
 func TestStore_IntegrationWithBackend(t *testing.T) {
+	var maxIndex uint64 = 25
+	count := &counter{latest: 3}
+	producers := map[string]*eventProducer{
+		"srv1": newEventProducer(pbsubscribe.Topic_ServiceHealth, "srv1", count, maxIndex),
+		"srv2": newEventProducer(pbsubscribe.Topic_ServiceHealth, "srv2", count, maxIndex),
+	}
+
+	sh := snapshotHandler{producers: producers}
 	handlers := map[stream.Topic]stream.SnapshotFunc{
-		pbsubscribe.Topic_ServiceHealth: func(stream.SubscribeRequest, stream.SnapshotAppender) (index uint64, err error) {
-			// TODO: add a couple services?
-			return 1, nil
-		},
+		pbsubscribe.Topic_ServiceHealth: sh.Snapshot,
 	}
 	pub := stream.NewEventPublisher(handlers, 10*time.Millisecond)
 
@@ -47,37 +52,42 @@ func TestStore_IntegrationWithBackend(t *testing.T) {
 
 	addr := runServer(t, pub)
 
-	var maxIndex uint64 = 25
-	count := &counter{latest: 3}
-	producers := map[string]*eventProducer{
-		"srv1": newEventProducer(pub, pbsubscribe.Topic_ServiceHealth, "srv1", count, maxIndex),
-		"srv2": newEventProducer(pub, pbsubscribe.Topic_ServiceHealth, "srv2", count, maxIndex),
-	}
-
 	consumers := []*consumer{
-		newConsumer(t, addr, store),
+		newConsumer(t, addr, store, "srv1"),
+		newConsumer(t, addr, store, "srv1"),
+		newConsumer(t, addr, store, "srv1"),
+		newConsumer(t, addr, store, "srv2"),
+		newConsumer(t, addr, store, "srv2"),
+		newConsumer(t, addr, store, "srv2"),
 	}
 
-	pgroup, pctx := errgroup.WithContext(ctx)
+	group, gctx := errgroup.WithContext(ctx)
 	for i := range producers {
 		producer := producers[i]
-		pgroup.Go(func() error {
-			producer.Produce(pctx)
+		group.Go(func() error {
+			producer.Produce(gctx, pub)
 			return nil
 		})
 	}
 
-	cgroup, cctx := errgroup.WithContext(ctx)
-	cgroup.Go(func() error {
-		return consumers[0].Consume(cctx, "srv1", maxIndex)
-	})
+	for i := range consumers {
+		consumer := consumers[i]
+		group.Go(func() error {
+			return consumer.Consume(gctx, maxIndex)
+		})
+	}
 
-	_ = pgroup.Wait()
-	_ = cgroup.Wait()
+	_ = group.Wait()
 
-	require.True(t, len(consumers[0].states) > 2, "expected more than %d events", len(consumers[0].states))
-	for idx, nodes := range consumers[0].states {
-		assertDeepEqual(t, idx, producers["srv1"].nodesByIndex[idx], nodes)
+	for i, consumer := range consumers {
+		t.Run(fmt.Sprintf("consumer %d", i), func(t *testing.T) {
+			require.True(t, len(consumer.states) > 2, "expected more than %d events", len(consumer.states))
+
+			expected := producers[consumer.srvName].nodesByIndex
+			for idx, nodes := range consumer.states {
+				assertDeepEqual(t, idx, expected[idx], nodes)
+			}
+		})
 	}
 }
 
@@ -144,15 +154,14 @@ var _ subscribe.Backend = (*backend)(nil)
 type eventProducer struct {
 	rand         *rand.Rand
 	counter      *counter
-	pub          *stream.EventPublisher
 	topic        stream.Topic
 	srvName      string
 	nodesByIndex map[uint64][]string
+	nodesLock    sync.Mutex
 	maxIndex     uint64
 }
 
 func newEventProducer(
-	pub *stream.EventPublisher,
 	topic stream.Topic,
 	srvName string,
 	counter *counter,
@@ -162,7 +171,6 @@ func newEventProducer(
 		rand:         rand.New(rand.NewSource(time.Now().UnixNano())),
 		counter:      counter,
 		nodesByIndex: map[uint64][]string{},
-		pub:          pub,
 		topic:        topic,
 		srvName:      srvName,
 		maxIndex:     maxIndex,
@@ -171,7 +179,7 @@ func newEventProducer(
 
 var minEventDelay = 10 * time.Millisecond
 
-func (e *eventProducer) Produce(ctx context.Context) {
+func (e *eventProducer) Produce(ctx context.Context, pub *stream.EventPublisher) {
 	var nodes []string
 	var nextID int
 
@@ -183,6 +191,7 @@ func (e *eventProducer) Produce(ctx context.Context) {
 			action = 1
 		}
 
+		e.nodesLock.Lock()
 		idx := e.counter.Next()
 		switch action {
 
@@ -248,8 +257,9 @@ func (e *eventProducer) Produce(ctx context.Context) {
 
 		}
 
-		e.pub.Publish([]stream.Event{event})
+		pub.Publish([]stream.Event{event})
 		e.nodesByIndex[idx] = copyNodeList(nodes)
+		e.nodesLock.Unlock()
 
 		if idx > e.maxIndex {
 			return
@@ -284,9 +294,10 @@ func (c *counter) Next() uint64 {
 type consumer struct {
 	healthClient *health.Client
 	states       map[uint64][]string
+	srvName      string
 }
 
-func newConsumer(t *testing.T, addr net.Addr, store *submatview.Store) *consumer {
+func newConsumer(t *testing.T, addr net.Addr, store *submatview.Store, srv string) *consumer {
 	conn, err := grpc.Dial(addr.String(), grpc.WithInsecure())
 	require.NoError(t, err)
 
@@ -302,11 +313,12 @@ func newConsumer(t *testing.T, addr net.Addr, store *submatview.Store) *consumer
 	return &consumer{
 		healthClient: c,
 		states:       make(map[uint64][]string),
+		srvName:      srv,
 	}
 }
 
-func (c *consumer) Consume(ctx context.Context, srv string, maxIndex uint64) error {
-	req := structs.ServiceSpecificRequest{ServiceName: srv}
+func (c *consumer) Consume(ctx context.Context, maxIndex uint64) error {
+	req := structs.ServiceSpecificRequest{ServiceName: c.srvName}
 	updateCh := make(chan cache.UpdateEvent, 10)
 
 	group, cctx := errgroup.WithContext(ctx)
@@ -329,4 +341,44 @@ func (c *consumer) Consume(ctx context.Context, srv string, maxIndex uint64) err
 		}
 	})
 	return group.Wait()
+}
+
+type snapshotHandler struct {
+	producers map[string]*eventProducer
+}
+
+func (s *snapshotHandler) Snapshot(req stream.SubscribeRequest, buf stream.SnapshotAppender) (index uint64, err error) {
+	producer := s.producers[req.Key]
+
+	producer.nodesLock.Lock()
+	defer producer.nodesLock.Unlock()
+	idx := atomic.LoadUint64(&producer.counter.latest)
+
+	// look backwards for an index that was used by the producer
+	nodes, ok := producer.nodesByIndex[idx]
+	for !ok && idx > 0 {
+		fmt.Printf("Not Using idx %d: %v\n", idx, nodes)
+		idx--
+		nodes, ok = producer.nodesByIndex[idx]
+	}
+	fmt.Printf("Using idx %d: %v\n", idx, nodes)
+
+	for _, node := range nodes {
+		event := stream.Event{
+			Topic: producer.topic,
+			Index: idx,
+			Payload: state.EventPayloadCheckServiceNode{
+				Op: pbsubscribe.CatalogOp_Register,
+				Value: &structs.CheckServiceNode{
+					Node: &structs.Node{Node: node},
+					Service: &structs.NodeService{
+						ID:      producer.srvName,
+						Service: producer.srvName,
+					},
+				},
+			},
+		}
+		buf.Append([]stream.Event{event})
+	}
+	return idx, nil
 }

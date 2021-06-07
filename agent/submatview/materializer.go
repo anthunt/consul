@@ -2,7 +2,6 @@ package submatview
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
@@ -199,7 +198,6 @@ func (m *Materializer) updateView(events []*pbsubscribe.Event, index uint64) err
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
-	fmt.Printf("RECV: %d\n", index)
 	if err := m.view.Update(events); err != nil {
 		return err
 	}
