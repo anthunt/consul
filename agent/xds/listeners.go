@@ -174,6 +174,8 @@ func (s *ResourceGenerator) listenersFromSnapshotConnectProxy(cfgSnap *proxycfg.
 
 		// Add a passthrough for every mesh endpoint that can be dialed directly,
 		// as opposed to via a virtual IP.
+		var passthroughChains []*envoy_listener_v3.FilterChain
+
 		for svc, passthrough := range cfgSnap.ConnectProxy.PassthroughUpstreams {
 			sn := structs.ServiceNameFromString(svc)
 			u := structs.Upstream{
@@ -197,8 +199,13 @@ func (s *ResourceGenerator) listenersFromSnapshotConnectProxy(cfgSnap *proxycfg.
 			}
 			filterChain.FilterChainMatch = makeFilterChainMatchFromAddrs(passthrough.Addrs)
 
-			outboundListener.FilterChains = append(outboundListener.FilterChains, filterChain)
+			passthroughChains = append(outboundListener.FilterChains, filterChain)
 		}
+
+		// The chains are sorted to avoid draining the listener if the list is provided out of order
+		sort.Slice(passthroughChains, func(i, j int) bool {
+			return passthroughChains[i].Name < passthroughChains[j].Name
+		})
 
 		// Add a catch-all filter chain that acts as a TCP proxy to non-catalog destinations
 		if cfgSnap.ConnectProxy.MeshConfig == nil ||
