@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"net"
 	"sort"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -51,10 +52,11 @@ func TestStore_IntegrationWithBackend(t *testing.T) {
 	store := submatview.NewStore(hclog.New(nil))
 	go store.Run(ctx)
 
+	var maxIndex uint64 = 200
+	count := &counter{latest: 3}
 	producers := []*eventProducer{
-		newEventProducer(pub, pbsubscribe.Topic_ServiceHealth, "srv1"),
-		// TODO:
-		//newEventProducer(pub, pbsubscribe.Topic_ServiceHealth, "srv2"),
+		newEventProducer(pub, pbsubscribe.Topic_ServiceHealth, "srv1", count, maxIndex),
+		newEventProducer(pub, pbsubscribe.Topic_ServiceHealth, "srv2", count, maxIndex),
 	}
 
 	pgroup, pctx := errgroup.WithContext(ctx)
@@ -91,8 +93,7 @@ func TestStore_IntegrationWithBackend(t *testing.T) {
 	cgroup.Go(func() error {
 		var idx uint64
 		for {
-			last := producers[0].LastIndex()
-			if last > 0 && idx == last {
+			if idx >= maxIndex {
 				return nil
 			}
 			select {
@@ -176,26 +177,29 @@ var _ subscribe.Backend = (*backend)(nil)
 
 type eventProducer struct {
 	rand         *rand.Rand
+	counter      *counter
 	pub          *stream.EventPublisher
 	topic        stream.Topic
 	srvName      string
 	nodesByIndex map[uint64][]string
-	done         chan struct{}
-	lastIndex    uint64
+	maxIndex     uint64
 }
 
 func newEventProducer(
 	pub *stream.EventPublisher,
 	topic stream.Topic,
 	srvName string,
+	counter *counter,
+	maxIndex uint64,
 ) *eventProducer {
 	return &eventProducer{
 		rand:         rand.New(rand.NewSource(time.Now().UnixNano())),
+		counter:      counter,
 		nodesByIndex: map[uint64][]string{},
-		done:         make(chan struct{}),
 		pub:          pub,
 		topic:        topic,
 		srvName:      srvName,
+		maxIndex:     maxIndex,
 	}
 }
 
@@ -204,12 +208,6 @@ var minEventDelay = 10 * time.Millisecond
 func (e *eventProducer) Produce(ctx context.Context) {
 	var nodes []string
 	var nextID int
-	var idx uint64 = 3
-
-	defer func() {
-		e.lastIndex = idx
-		close(e.done)
-	}()
 
 	for ctx.Err() == nil {
 		var event stream.Event
@@ -219,6 +217,7 @@ func (e *eventProducer) Produce(ctx context.Context) {
 			action = 1
 		}
 
+		idx := e.counter.Next()
 		switch action {
 
 		case 0: // Deregister
@@ -240,7 +239,6 @@ func (e *eventProducer) Produce(ctx context.Context) {
 					},
 				},
 			}
-			fmt.Printf("%d: DEREG %v\n", idx, node)
 
 		case 1: // Register new
 			node := nodeName(nextID)
@@ -261,7 +259,6 @@ func (e *eventProducer) Produce(ctx context.Context) {
 					},
 				},
 			}
-			fmt.Printf("%d: REG   %v\n", idx, node)
 
 		case 2: // Register update
 			node := nodes[e.rand.Intn(len(nodes))]
@@ -280,24 +277,17 @@ func (e *eventProducer) Produce(ctx context.Context) {
 				},
 			}
 
-			fmt.Printf("%d: UPD   %v\n", idx, node)
 		}
 
 		e.pub.Publish([]stream.Event{event})
 		e.nodesByIndex[idx] = copyNodeList(nodes)
 
-		idx++
+		if idx > e.maxIndex {
+			return
+		}
+
 		delay := time.Duration(rand.Intn(50)) * time.Millisecond
 		time.Sleep(minEventDelay + delay)
-	}
-}
-
-func (e *eventProducer) LastIndex() uint64 {
-	select {
-	case <-e.done:
-		return e.lastIndex
-	default:
-		return 0
 	}
 }
 
@@ -312,4 +302,12 @@ func copyNodeList(nodes []string) []string {
 	}
 	sort.Strings(result)
 	return result
+}
+
+type counter struct {
+	latest uint64
+}
+
+func (c *counter) Next() uint64 {
+	return atomic.AddUint64(&c.latest, 1)
 }
